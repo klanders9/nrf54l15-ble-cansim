@@ -3,4 +3,10 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(nRF54L15_telemetry)
 
-target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE
+    src/main.cpp
+    src/sensor/ImuSensor.cpp
+    src/ble/TelemetryService.cpp
+)
+
+target_include_directories(app PRIVATE src)
