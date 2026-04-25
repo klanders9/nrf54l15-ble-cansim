@@ -7,6 +7,8 @@ target_sources(app PRIVATE
     src/main.cpp
     src/sensor/ImuSensor.cpp
     src/ble/TelemetryService.cpp
+    src/can/CanSimulator.cpp
+    src/can/CanGatewayService.cpp
 )
 
 target_include_directories(app PRIVATE src)

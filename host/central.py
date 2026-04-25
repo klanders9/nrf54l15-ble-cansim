@@ -1,55 +1,86 @@
 """
-central.py — Raspberry Pi 4 BLE central for nRF54L15 IMU telemetry.
+central.py — Raspberry Pi 4 BLE central for nRF54L15 telemetry.
 
 Setup:
     pip install -r requirements.txt
 
 Run:
-    python3 central.py                  # curses terminal dashboard (default)
-    python3 central.py --plot           # live matplotlib plot (better on desktop)
+    python3 central.py                  # rich terminal dashboard (default)
+    python3 central.py --plot           # live matplotlib plot (IMU only)
     python3 central.py --csv my.csv     # custom CSV output path
 
-Scans for "NordicTelemetry", subscribes to accel + gyro GATT notify
-characteristics, and writes one timestamped CSV row per firmware tick (~50 Hz).
+Scans for "NordicTelemetry", subscribes to:
+  - Project 1: accel + gyro notify characteristics (~50 Hz)
+  - Project 2: EEC1 / ET1 / EFLP1 CAN gateway characteristics (notify-on-change)
 """
 
 import argparse
 import asyncio
 import csv
-import curses
+import select
 import struct
 import sys
+import termios
 import threading
 import time
+import tty
 from collections import deque
 
 from bleak import BleakClient, BleakScanner
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
 
-# ── BLE identifiers — must match TelemetryService.cpp ─────────────────────
+# ── BLE identifiers — must match firmware ──────────────────────────────────────
 DEVICE_NAME = "NordicTelemetry"
-ACCEL_UUID  = "b0b1b2b3-b4b5-b6b7-b8b9-babbbcbdbebf"
-GYRO_UUID   = "c0c1c2c3-c4c5-c6c7-c8c9-cacbcccdcecf"
 
-PLOT_WINDOW = 200  # samples in the scrolling plot (--plot mode only)
+# Project 1 — IMU (TelemetryService.cpp)
+ACCEL_UUID = "b0b1b2b3-b4b5-b6b7-b8b9-babbbcbdbebf"
+GYRO_UUID  = "c0c1c2c3-c4c5-c6c7-c8c9-cacbcccdcecf"
 
-# ── Shared state (asyncio BLE thread writes, display thread reads) ─────────
+# Project 2 — CAN gateway (CanGatewayService.cpp)
+EEC1_UUID  = "e0e1e2e3-e4e5-e6e7-e8e9-eaebecedeeef"  # PGN 61444 — engine RPM
+ET1_UUID   = "f0f1f2f3-f4f5-f6f7-f8f9-fafbfcfdfeff"  # PGN 65262 — coolant temp
+EFLP1_UUID = "10111213-1415-1617-1819-1a1b1c1d1e1f"  # PGN 65263 — fuel pressure
+
+PLOT_WINDOW = 200  # samples in scrolling plot (--plot mode only)
+
+# ── Shared state (BLE thread writes, display thread reads) ─────────────────────
 _lock      = threading.Lock()
 _latest    = dict(ax=0.0, ay=0.0, az=0.0, gx=0.0, gy=0.0, gz=0.0)
 _buf       = {k: deque(maxlen=PLOT_WINDOW) for k in _latest}
-_sample_ts: deque = deque(maxlen=100)  # timestamps of recent gyro callbacks for rate calc
+_sample_ts: deque = deque(maxlen=100)  # gyro callback timestamps for Hz calc
+
+_can_latest = dict(rpm=None, coolant_c=None, fuel_kpa=None, last_ts=None)
 
 _csv_writer = None
 _t0: float  = 0.0
 
 
-# ── Notification callbacks ─────────────────────────────────────────────────
+# ── J1939 payload decoding ─────────────────────────────────────────────────────
+# BLE payload (12 bytes): PGN[0-2 LE] | SA[3] | J1939 data[4-11]
+
+def _decode_eec1(data: bytearray) -> float:
+    # Engine Speed: J1939 data bytes 3-4 (payload offset 7), uint16 LE, 0.125 rpm/bit
+    raw = struct.unpack_from('<H', data, 7)[0]
+    return raw / 8.0
+
+def _decode_et1(data: bytearray) -> float:
+    # Coolant Temp: J1939 data byte 0 (payload offset 4), 1°C/bit, offset -40°C
+    return float(data[4]) - 40.0
+
+def _decode_eflp1(data: bytearray) -> float:
+    # Fuel Delivery Pressure: J1939 data byte 0 (payload offset 4), 4 kPa/bit
+    return float(data[4]) * 4.0
+
+
+# ── Notification callbacks ─────────────────────────────────────────────────────
 
 def _on_accel(sender, data: bytearray) -> None:
     ax, ay, az = (v / 100.0 for v in struct.unpack_from('<3h', data))
     with _lock:
-        _latest['ax'] = ax
-        _latest['ay'] = ay
-        _latest['az'] = az
+        _latest.update(ax=ax, ay=ay, az=az)
         _buf['ax'].append(ax)
         _buf['ay'].append(ay)
         _buf['az'].append(az)
@@ -60,9 +91,7 @@ def _on_gyro(sender, data: bytearray) -> None:
     gx, gy, gz = (v / 100.0 for v in struct.unpack_from('<3h', data))
     ts = time.time()
     with _lock:
-        _latest['gx'] = gx
-        _latest['gy'] = gy
-        _latest['gz'] = gz
+        _latest.update(gx=gx, gy=gy, gz=gz)
         _buf['gx'].append(gx)
         _buf['gy'].append(gy)
         _buf['gz'].append(gz)
@@ -74,7 +103,28 @@ def _on_gyro(sender, data: bytearray) -> None:
         _csv_writer.writerow(row)
 
 
-# ── BLE task ───────────────────────────────────────────────────────────────
+def _on_eec1(sender, data: bytearray) -> None:
+    rpm = _decode_eec1(data)
+    with _lock:
+        _can_latest['rpm']     = rpm
+        _can_latest['last_ts'] = time.time()
+
+
+def _on_et1(sender, data: bytearray) -> None:
+    coolant = _decode_et1(data)
+    with _lock:
+        _can_latest['coolant_c'] = coolant
+        _can_latest['last_ts']   = time.time()
+
+
+def _on_eflp1(sender, data: bytearray) -> None:
+    fuel = _decode_eflp1(data)
+    with _lock:
+        _can_latest['fuel_kpa'] = fuel
+        _can_latest['last_ts']  = time.time()
+
+
+# ── BLE task ───────────────────────────────────────────────────────────────────
 
 async def _ble_task(stop_event: threading.Event) -> None:
     print(f"Scanning for '{DEVICE_NAME}'...")
@@ -88,7 +138,15 @@ async def _ble_task(stop_event: threading.Event) -> None:
     async with BleakClient(device) as client:
         await client.start_notify(ACCEL_UUID, _on_accel)
         await client.start_notify(GYRO_UUID,  _on_gyro)
-        print("Subscribed. Logging — press Ctrl-C to stop.\n")
+
+        try:
+            await client.start_notify(EEC1_UUID,  _on_eec1)
+            await client.start_notify(ET1_UUID,   _on_et1)
+            await client.start_notify(EFLP1_UUID, _on_eflp1)
+        except Exception as exc:
+            print(f"  CAN gateway not found ({exc}); IMU-only mode", file=sys.stderr)
+
+        print("Subscribed. Dashboard active — press Ctrl-C to stop.\n")
         while not stop_event.is_set():
             await asyncio.sleep(0.1)
         await client.stop_notify(ACCEL_UUID)
@@ -99,69 +157,85 @@ def _run_ble(stop_event: threading.Event) -> None:
     asyncio.run(_ble_task(stop_event))
 
 
-# ── Curses terminal dashboard ──────────────────────────────────────────────
+# ── Rich terminal dashboard ────────────────────────────────────────────────────
 
-def _run_curses(stdscr, stop_event: threading.Event) -> None:
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_CYAN,  -1)  # headers
-    curses.init_pair(2, curses.COLOR_GREEN, -1)  # values
-    curses.init_pair(3, curses.COLOR_YELLOW, -1) # rate
+_IMU_ROWS = [
+    ('ax', 'Accel X', 'm/s²'),
+    ('ay', 'Accel Y', 'm/s²'),
+    ('az', 'Accel Z', 'm/s²'),
+    ('gx', 'Gyro  X', 'rad/s'),
+    ('gy', 'Gyro  Y', 'rad/s'),
+    ('gz', 'Gyro  Z', 'rad/s'),
+]
 
-    CHANNELS = [
-        ('ax', 'Accel X', 'm/s²'),
-        ('ay', 'Accel Y', 'm/s²'),
-        ('az', 'Accel Z', 'm/s²'),
-        ('gx', 'Gyro  X', 'rad/s'),
-        ('gy', 'Gyro  Y', 'rad/s'),
-        ('gz', 'Gyro  Z', 'rad/s'),
-    ]
 
-    while not stop_event.is_set():
-        key = stdscr.getch()
-        if key == ord('q'):
-            stop_event.set()
-            break
+def _imu_panel(snapshot: dict, rate: int) -> Panel:
+    t = Table(show_header=False, box=None, padding=(0, 1))
+    t.add_column(style='cyan',  width=10)
+    t.add_column(style='green', justify='right', width=10)
+    t.add_column(style='dim',   width=6)
+    for key, label, unit in _IMU_ROWS:
+        t.add_row(label, f'{snapshot[key]:+.3f}', unit)
+    t.add_row('', '', '')
+    t.add_row('Rate', str(rate), 'Hz')
+    return Panel(t, title='[bold cyan]IMU Telemetry[/]', border_style='cyan')
 
-        with _lock:
-            snapshot = dict(_latest)
-            ts_list  = list(_sample_ts)
 
-        now = time.time()
-        recent = [t for t in ts_list if now - t < 1.0]
-        rate = len(recent)
+def _can_panel(snap: dict) -> Panel:
+    def _fmt(v, fmt: str) -> str:
+        return format(v, fmt) if v is not None else '—'
 
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-        title = "NordicTelemetry — IMU live data"
-        stdscr.addstr(0, max(0, (w - len(title)) // 2), title,
-                      curses.color_pair(1) | curses.A_BOLD)
-        stdscr.addstr(1, 0, "─" * min(w - 1, 50), curses.color_pair(1))
+    t = Table(show_header=False, box=None, padding=(0, 1))
+    t.add_column(style='yellow',       width=16)
+    t.add_column(style='bright_white', justify='right', width=8)
+    t.add_column(style='dim',          width=5)
+    t.add_row('Engine RPM',    _fmt(snap['rpm'],       '.0f'), 'RPM')
+    t.add_row('Coolant Temp',  _fmt(snap['coolant_c'], '.0f'), '°C')
+    t.add_row('Fuel Pressure', _fmt(snap['fuel_kpa'],  '.0f'), 'kPa')
+    t.add_row('', '', '')
+    last = snap['last_ts']
+    if last is not None:
+        t.add_row('Updated', f'{time.time() - last:.1f}', 's ago')
+    else:
+        t.add_row('Updated', '—', '')
+    return Panel(t, title='[bold yellow]J1939 CAN Gateway[/]', border_style='yellow')
 
-        for i, (key_name, label, unit) in enumerate(CHANNELS):
-            row = 3 + i
-            val = snapshot[key_name]
-            stdscr.addstr(row, 2,  f"{label}:", curses.color_pair(1))
-            stdscr.addstr(row, 14, f"{val:+8.3f} {unit}", curses.color_pair(2))
 
-        stdscr.addstr(10, 2, "─" * min(w - 3, 46), curses.color_pair(1))
-        stdscr.addstr(11, 2, f"Rate: {rate:3d} Hz", curses.color_pair(3))
-        stdscr.addstr(12, 2, "q — quit", curses.color_pair(1))
-
-        stdscr.refresh()
-        time.sleep(0.1)
+def _run_keyboard(stop_event: threading.Event) -> None:
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while not stop_event.is_set():
+            if select.select([sys.stdin], [], [], 0.2)[0]:
+                if sys.stdin.read(1).lower() == 'q':
+                    stop_event.set()
+                    break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def _run_dashboard(stop_event: threading.Event) -> None:
+    layout = Layout()
+    layout.split_row(Layout(name='imu'), Layout(name='can'))
+    threading.Thread(target=_run_keyboard, args=(stop_event,), daemon=True).start()
     try:
-        curses.wrapper(_run_curses, stop_event)
+        with Live(layout, refresh_per_second=10, screen=True):
+            while not stop_event.is_set():
+                with _lock:
+                    imu_snap = dict(_latest)
+                    ts_list  = list(_sample_ts)
+                    can_snap = dict(_can_latest)
+                now  = time.time()
+                rate = len([t for t in ts_list if now - t < 1.0])
+                layout['imu'].update(_imu_panel(imu_snap, rate))
+                layout['can'].update(_can_panel(can_snap))
+                time.sleep(0.1)
     except KeyboardInterrupt:
         stop_event.set()
 
 
-# ── Live matplotlib plot (--plot mode) ────────────────────────────────────
+# ── Live matplotlib plot (--plot mode, IMU only) ──────────────────────────────
 
 def _run_plot(stop_event: threading.Event) -> None:
     import matplotlib.pyplot as plt
@@ -169,12 +243,10 @@ def _run_plot(stop_event: threading.Event) -> None:
 
     fig, (ax_a, ax_g) = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
     fig.suptitle("NordicTelemetry — live IMU data", fontsize=12)
-
     ax_a.set_ylabel("Accel (m/s²)")
     ax_a.set_ylim(-20, 20)
     ax_a.axhline(0, color='k', linewidth=0.5)
     ax_a.grid(True, alpha=0.3)
-
     ax_g.set_ylabel("Gyro (rad/s)")
     ax_g.set_ylim(-10, 10)
     ax_g.set_xlabel(f"newest {PLOT_WINDOW} samples")
@@ -183,7 +255,6 @@ def _run_plot(stop_event: threading.Event) -> None:
 
     x        = list(range(PLOT_WINDOW))
     nan_fill = [float('nan')] * PLOT_WINDOW
-
     lines = {
         'ax': ax_a.plot(x, nan_fill, label='ax')[0],
         'ay': ax_a.plot(x, nan_fill, label='ay')[0],
@@ -203,7 +274,7 @@ def _run_plot(stop_event: threading.Event) -> None:
         with _lock:
             snapshot = {k: list(v) for k, v in _buf.items()}
         for key, line in lines.items():
-            d = snapshot[key]
+            d      = snapshot[key]
             padded = [float('nan')] * (PLOT_WINDOW - len(d)) + d
             line.set_ydata(padded)
         return list(lines.values())
@@ -219,15 +290,15 @@ def _run_plot(stop_event: threading.Event) -> None:
         stop_event.set()
 
 
-# ── Entry point ────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="nRF54L15 BLE IMU logger")
+    parser = argparse.ArgumentParser(description="nRF54L15 BLE telemetry dashboard")
     parser.add_argument('--csv', default='imu_log.csv', metavar='FILE',
                         help='CSV output path (default: imu_log.csv)')
     parser.add_argument('--plot', action='store_true',
-                        help='Show live matplotlib plot instead of terminal dashboard '
-                             '(better on desktop; slow on Pi 4)')
+                        help='Live matplotlib plot instead of terminal dashboard '
+                             '(IMU only; better on desktop than on Pi 4)')
     args = parser.parse_args()
 
     global _csv_writer, _t0
