@@ -18,3 +18,6 @@ venv/
 
 # Internal project notes
 CLAUDE.md
+
+# mac crap
+.DS_Store
