@@ -5,16 +5,23 @@
 #include "ble/TelemetryService.hpp"
 #include "can/CanSimulator.hpp"
 #include "can/CanGatewayService.hpp"
+#include "led/LedIndicator.hpp"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-static ImuSensor        imu;
-static TelemetryService ble;
-static CanSimulator     can_sim;
+static ImuSensor         imu;
+static TelemetryService  ble;
+static CanSimulator      can_sim;
 static CanGatewayService can_gw;
+static LedIndicator      leds;
 
 int main()
 {
+    if (!leds.init()) {
+        LOG_ERR("LED init failed");
+        return -1;
+    }
+
     if (!imu.init()) {
         LOG_ERR("IMU init failed — check wiring and overlay");
         return -1;
