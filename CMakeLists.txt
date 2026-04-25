@@ -9,6 +9,7 @@ target_sources(app PRIVATE
     src/ble/TelemetryService.cpp
     src/can/CanSimulator.cpp
     src/can/CanGatewayService.cpp
+    src/led/LedIndicator.cpp
 )
 
 target_include_directories(app PRIVATE src)
