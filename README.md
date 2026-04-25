@@ -79,6 +79,8 @@ python3 host/central.py --csv my_run.csv
 
 The script scans for `NordicTelemetry` and subscribes to all available GATT notify characteristics. If the CAN gateway service is present, a second panel shows the J1939 values alongside the IMU panel. IMU data is written to CSV at ~50 Hz. Press `q` or Ctrl-C to quit.
 
+![Dashboard screenshot](host/screenshot.png)
+
 ---
 
 ## Project Structure
